@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import json
 import os
-import difflib
 import io
 import tempfile
 from pdf2image import convert_from_path
@@ -10,52 +9,53 @@ from google import genai
 from google.genai import types
 
 # --- 1. 환경 설정 ---
-st.set_page_config(page_title="한양대 OCR 명부 변환기", layout="wide", page_icon="🎓")
+st.set_page_config(page_title="한양대 OCR 변환기", layout="wide", page_icon="🎓")
 st.title("🎓 한양대 고정밀 명부 OCR 자동화 시스템")
 
 # Streamlit Secrets에서 API 키 호출
 try:
-    API_KEY = st.secrets["GEMINI_API_KEY"]
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 except:
-    API_KEY = ""
-client = genai.Client(api_key=API_KEY)
+    st.error("API 키가 설정되지 않았습니다. Secrets를 확인하세요.")
+    st.stop()
 
-# Poppler 경로 설정
-LOCAL_POPPLER = r"C:\Users\seednpc16\Desktop\graduate_pdf_prj\Release-26.02.0-0\poppler-26.02.0\Library\bin"
-POPPLER_PATH = LOCAL_POPPLER if os.path.exists(LOCAL_POPPLER) else None
-
-# 학과 마스터 데이터 및 교정 함수
-HANYANG_MASTER = ["건축학부", "컴퓨터소프트웨어학부", "경영학부", "의학과", "간호학과"] # 마스터 리스트는 기존과 동일하게 유지
-def map_to_master_list(raw_text):
-    if not raw_text or pd.isna(raw_text): return ""
-    cleaned = str(raw_text).strip()
-    matches = difflib.get_close_matches(cleaned, HANYANG_MASTER, n=1, cutoff=0.25)
-    return matches[0] if matches else cleaned
-
-# --- 2. 메인 로직 (파일 처리 부분 수정됨) ---
+# --- 2. 메인 UI 및 분할 처리 로직 ---
 uploaded_file = st.file_uploader("명부 PDF 파일을 업로드하세요", type=["pdf"])
+batch_size = st.number_input("한 번에 처리할 페이지 수 (API 부하 방지용)", min_value=1, max_value=10, value=3)
 
-if uploaded_file is not None:
-    if st.button("🚀 고정밀 변환 엔진 가동"):
-        with st.spinner("1단계: PDF 파일을 이미지로 변환 중..."):
-            try:
-                # [수정된 부분]: 업로드된 파일을 임시 파일로 저장하여 경로 인식 문제 해결
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    tmp_path = tmp_file.name
-                
-                images = convert_from_path(tmp_path, poppler_path=POPPLER_PATH, dpi=300)
-                os.remove(tmp_path) # 사용 후 삭제
-            except Exception as e:
-                st.error(f"PDF 파일 분할 실패: {e}")
-                st.stop()
-
-        # (중략: 데이터 추출 및 AI 분석 로직은 기존과 동일)
+if uploaded_file and st.button("🚀 분할 변환 엔진 가동"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = tmp.name
+    
+    # 전체 페이지 확인
+    from pdf2image import pdfinfo_from_path
+    info = pdfinfo_from_path(tmp_path)
+    total_pages = info["Pages"]
+    
+    all_results = []
+    
+    # 페이지를 batch_size만큼 나누어 처리
+    for i in range(1, total_pages + 1, batch_size):
+        end = min(i + batch_size - 1, total_pages)
+        st.write(f"⏳ 처리 중: {i} ~ {end} 페이지 (총 {total_pages} 페이지)")
         
-        # 엑셀 다운로드 버튼
-        st.download_button(
-            label="📥 정제 완료된 최종 엑셀 파일(.xlsx) 다운로드",
-            data=excel_data, # 변환된 엑셀 데이터
-            file_name="hanyang_ocr_clean_result.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        images = convert_from_path(tmp_path, first_page=i, last_page=end, dpi=300)
+        
+        for img in images:
+            prompt = "이 명부 이미지에서 정보를 JSON 배열(name, company_job, phone, major, student_id)로 추출해."
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[img, prompt],
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            all_results.extend(json.loads(response.text))
+            
+    # 결과 저장
+    df = pd.DataFrame(all_results)
+    excel_buffer = io.BytesIO()
+    df.to_excel(excel_buffer, index=False)
+    
+    st.download_button("📥 엑셀 파일 다운로드", excel_buffer.getvalue(), "result.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    os.remove(tmp_path)
+    st.success("완료!")
